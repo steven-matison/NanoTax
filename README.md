@@ -8,6 +8,7 @@
 
 CPU storm, GPU storm, NPU storm, then all three together, on one terminal dashboard that reads the hardware straight from sysfs.
 
+[![ci](https://github.com/steven-matison/NanoTax/actions/workflows/ci.yml/badge.svg)](https://github.com/steven-matison/NanoTax/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 ![version](https://img.shields.io/badge/nanotax-1.0.0-5fd7d7.svg)
 ![shellcheck](https://img.shields.io/badge/shellcheck-clean-brightgreen.svg)
@@ -226,7 +227,7 @@ NANOTAX_HAILORTCLI=~/hailo/hailort/build/hailort/hailortcli/hailortcli nanotax
 - **Every worker dies with it.** One `trap` on `EXIT INT TERM HUP` kills the pool, so Ctrl-C mid-storm leaves nothing behind.
 - **No sudo, no installs, no restarts.** It reads sysfs and starts its own processes. That's all.
 - **Nothing written outside a `mktemp -d`**, except the optional CUDA burner binary in `~/.cache/nanotax`.
-- **It degrades instead of failing.** No Hailo, no CUDA, no daemon, not even a Jetson: each panel says what it couldn't find and the run goes on.
+- **It degrades instead of failing.** No Hailo, no CUDA, no daemon, not even a Jetson: each panel says what it couldn't find and the run goes on. CI runs it on plain x86_64 and arm64 runners to keep that true.
 
 ## Rendering the README art
 
