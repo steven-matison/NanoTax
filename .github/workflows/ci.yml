@@ -12,7 +12,7 @@ jobs:
       - name: shellcheck
         run: shellcheck nanotax install.sh
       - name: bash -n
-        run: bash -n nanotax && bash -n install.sh
+        run: bash -n nanotax && bash -n install.sh && bash -n tests/test_nanotax.sh
       - name: python compiles
         run: python3 -m py_compile tools/ansi2svg.py
 
@@ -30,3 +30,10 @@ jobs:
         run: ./nanotax --loader --color
       - name: full run, 2 s phases, GPU off
         run: NANOTAX_GPU=off ./nanotax -y 2
+
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: contract suite
+        run: tests/test_nanotax.sh
