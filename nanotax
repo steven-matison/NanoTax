@@ -82,23 +82,16 @@ else
   R='' B='' D='' RED='' GRN='' YEL='' BLU='' MAG='' CYN='' ORG=''
 fi
 
-# TERM first. Anything still alive after a short beat gets KILL, so a worker
-# that ignores TERM cannot outlive the script or the phase that started it.
+# TERM first, a short beat, then KILL, so a worker that ignores TERM cannot
+# outlive the script or the phase that started it. No liveness check between
+# the two: an exited child is still a zombie until wait(), so kill -0 would
+# say "alive" either way, and KILL on an exited pid is a no-op.
 kill_workers() {
-  local p live=0
-  for p in "${PIDS[@]:-}"; do
-    [[ -n ${p:-} ]] || continue
-    kill "$p" 2>/dev/null || true
-    kill -0 "$p" 2>/dev/null && live=1
-  done
-  if (( live )); then
-    sleep 0.2
-    for p in "${PIDS[@]:-}"; do
-      [[ -n ${p:-} ]] || continue
-      kill -0 "$p" 2>/dev/null || continue
-      kill -KILL "$p" 2>/dev/null || true
-    done
-  fi
+  local p
+  (( ${#PIDS[@]} )) || return 0
+  for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done
+  sleep 0.2
+  for p in "${PIDS[@]}"; do kill -KILL "$p" 2>/dev/null; done
   wait 2>/dev/null || true
 }
 
@@ -245,7 +238,8 @@ find_hailo() {
   local p
   for p in "${NANOTAX_HAILO_PY:-}" python3 "$HOME/hailo-infer/venv/bin/python"; do
     [[ -n $p ]] || continue
-    if "$p" -c 'import hailo_platform' 2>/dev/null; then HAILO_PY=$p; break; fi
+    # importing hailo_platform drops a hailort.log in the cwd, so probe from WORK
+    if (cd "$WORK" && "$p" -c 'import hailo_platform' 2>/dev/null); then HAILO_PY=$p; break; fi
   done
 
   HEF="${NANOTAX_HEF:-}"

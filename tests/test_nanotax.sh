@@ -15,24 +15,33 @@ say() { printf '%s\n' "$*"; }
 ok() { PASS=$((PASS + 1)); say "PASS  $1"; }
 fail() { FAIL=$((FAIL + 1)); say "FAIL  $1"; [[ -n ${2:-} ]] && say "      $2"; }
 
-reap_spinners() {
-  local pid cmd
+# Every nanotax this suite starts. Spinner helpers only look at awk workers
+# whose parent is one of these, or that were orphaned (reparented to pid 1),
+# so a nanotax running in another terminal is neither counted nor killed.
+NT_PIDS=()
+
+spinners() {
+  local pid cmd ppid p
   for pid in $(pgrep -u "$(id -u)" -x awk 2>/dev/null || true); do
     cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
     [[ $cmd == *1.0000001* ]] || continue
+    ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+    [[ $ppid == 1 ]] && { echo "$pid"; continue; }
+    for p in "${NT_PIDS[@]:-}"; do
+      [[ $ppid == "$p" ]] && { echo "$pid"; break; }
+    done
+  done
+}
+
+reap_spinners() {
+  local pid
+  for pid in $(spinners); do
     kill -KILL "$pid" 2>/dev/null || true
   done
 }
 trap reap_spinners EXIT
 
-spinner_count() {
-  local pid cmd n=0
-  for pid in $(pgrep -u "$(id -u)" -x awk 2>/dev/null || true); do
-    cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
-    [[ $cmd == *1.0000001* ]] && n=$((n + 1))
-  done
-  echo "$n"
-}
+spinner_count() { spinners | wc -l; }
 
 tmp_dirs() {
   find /tmp -maxdepth 1 -name 'nanotax.*' -user "$(id -u)" 2>/dev/null | sort
@@ -70,6 +79,18 @@ start_nt() {
   # Own session, so killing its process group cannot hit this test.
   setsid env NANOTAX_GPU=off NANOTAX_COLOR=never "$NT" "$@" >"$NT_LOG" 2>&1 &
   NT_PID=$!
+  NT_PIDS+=("$NT_PID")
+}
+
+# Block until $log mentions $phase or $pid is gone. Returns 0 on the phase.
+wait_for_phase() {
+  local pid=$1 log=$2 phase=$3 deadline=$((SECONDS + ${4:-15}))
+  while (( SECONDS < deadline )); do
+    grep -q "$phase" "$log" && return 0
+    kill -0 "$pid" 2>/dev/null || return 1
+    sleep 0.1
+  done
+  return 1
 }
 
 # ── syntax and flags ───────────────────────────────────────────────────────
@@ -116,6 +137,15 @@ fi
 [[ $(tmp_dirs) == "$before" ]] && ok "--loader removes its temp dir" \
   || fail "--loader removes its temp dir"
 
+# The header promises nothing is written outside the mktemp dir. HailoRT, for
+# one, drops a hailort.log wherever it is imported from, so run from an empty
+# directory and insist it stays empty.
+cwd="$(mktemp -d)"; KEEP+=("$cwd")
+(cd "$cwd" && NANOTAX_GPU=off NANOTAX_COLOR=never "$NT" --loader >/dev/null 2>&1)
+stray="$(ls -A "$cwd")"
+[[ -z $stray ]] && ok "--loader writes nothing to the current directory" \
+  || fail "--loader writes nothing to the current directory" "left behind: $stray"
+
 # ── install.sh copies the local script and does not curl ──────────────────
 fake="$(mktemp -d)"; KEEP+=("$fake")
 mkdir -p "$fake/bin" "$fake/prefix"
@@ -134,21 +164,21 @@ got="$("$fake/prefix/nanotax" --version 2>&1 || true)"
 [[ $got == "nanotax 1.0.0" ]] && ok "installed copy runs --version" \
   || fail "installed copy runs --version" "$got"
 
-# ── mktemp failure must not continue, and must not write /flood.py ────────
+# ── mktemp failure is fatal ────────────────────────────────────────────────
+# With WORK empty the script would go on to write "$WORK/flood.py", i.e.
+# /flood.py. Aborting on a failed mktemp is the whole contract here.
 fake2="$(mktemp -d)"; KEEP+=("$fake2")
 printf '%s\n' '#!/bin/sh' 'echo mktemp-disabled >&2' 'exit 1' >"$fake2/mktemp"
 chmod +x "$fake2/mktemp"
-rm -f /tmp/nanotax-flood-probe
-# The bug writes "$WORK/flood.py". With an empty WORK that is /flood.py,
-# which a normal user cannot create. Probe the empty-WORK write by wrapping
-# nothing else: the contract is simply "mktemp failure is fatal".
 PATH="$fake2:$PATH" NANOTAX_GPU=off "$NT" --loader >"$fake2/out" 2>"$fake2/err"
 rc=$?
 [[ $rc -ne 0 ]] && ok "mktemp failure aborts the run" \
   || fail "mktemp failure aborts the run" "exit $rc; a failed mktemp is ignored and the run continues"
-[[ ! -e /flood.py ]] && ok "mktemp failure does not create /flood.py" \
-  || fail "mktemp failure does not create /flood.py"
-reap_spinners
+if grep -q "INVENTORY" "$fake2/out"; then
+  fail "mktemp failure stops before the inventory" "the run continued with an empty WORK"
+else
+  ok "mktemp failure stops before the inventory"
+fi
 
 # ── short run: phases, honest labels, cleanup, real CPU load ──────────────
 start_nt -y 3
@@ -189,14 +219,16 @@ fi
 for phase in "PHASE 1" "PHASE 2" "PHASE 3" "PHASE 5" "PHASE 6" "VERDICT"; do
   grep -q "$phase" "$log" && ok "output contains $phase" || fail "output contains $phase"
 done
-if [[ -e /dev/hailo0 ]]; then
-  grep -q "PHASE 4" "$log" && ok "PHASE 4 runs when /dev/hailo0 exists" \
-    || fail "PHASE 4 runs when /dev/hailo0 exists"
+# The NPU storm needs the device node, hailortcli, and a HEF — npu_armed() in
+# the script. A node alone is not enough, and the inventory says so.
+if [[ -e /dev/hailo0 ]] && ! grep -q "NPU storm skipped" "$log"; then
+  grep -q "PHASE 4" "$log" && ok "PHASE 4 runs when the NPU storm is armed" \
+    || fail "PHASE 4 runs when the NPU storm is armed"
 else
   if grep -q "PHASE 4" "$log"; then
-    fail "PHASE 4 is skipped when no Hailo is present"
+    fail "PHASE 4 is skipped when the NPU storm is not armed"
   else
-    ok "PHASE 4 is skipped when no Hailo is present"
+    ok "PHASE 4 is skipped when the NPU storm is not armed"
   fi
 fi
 if grep -q "TensorRT flood" "$log"; then
@@ -216,54 +248,65 @@ fi
 [[ $(tmp_dirs) == "$before" ]] && ok "short run removes its temp dir" \
   || fail "short run removes its temp dir" "$(tmp_dirs)"
 
-# ── SIGTERM aborts the run. INT/HUP share this trap. ───────────────────────
-# Signal during idle, before any spinner exists. The header says the trap
-# ends the run. What it does today is run cleanup and then keep going, so
-# the CPU storm still starts.
+# ── SIGTERM aborts the run ─────────────────────────────────────────────────
+# Only TERM can be tested from here: bash starts a `&` child with SIGINT
+# ignored, and a signal ignored at entry cannot be trapped, so an INT sent to
+# a backgrounded nanotax proves nothing. INT and HUP share the TERM handler
+# in the script, and Ctrl-C from a real terminal is covered by hand.
+
+# During idle, before any spinner exists: the run must end, not continue
+# into the CPU storm after cleanup.
 start_nt -y 30
 pid=$NT_PID
 log=$NT_LOG
-deadline=$((SECONDS + 15))
-while (( SECONDS < deadline )); do
-  grep -q "PHASE 1" "$log" && break
-  kill -0 "$pid" 2>/dev/null || break
-  sleep 0.1
-done
-if grep -q "PHASE 1" "$log" && ! grep -q "PHASE 2" "$log"; then
+if wait_for_phase "$pid" "$log" "PHASE 1" && ! grep -q "PHASE 2" "$log"; then
   ok "signal test caught the run during idle"
 else
   fail "signal test caught the run during idle"
 fi
 kill -TERM "$pid" 2>/dev/null || true
-alive=1
-for ((i = 0; i < 10; i++)); do
-  kill -0 "$pid" 2>/dev/null || { alive=0; break; }
-  sleep 0.2
-done
-if (( alive == 0 )); then
-  ok "SIGTERM ends the process within 2s"
-  wait "$pid" 2>/dev/null || true
-  [[ $(spinner_count) -eq 0 ]] && ok "SIGTERM leaves no awk spinners" \
-    || fail "SIGTERM leaves no awk spinners" "$(spinner_count) still running"
+if wait_or_kill "$pid" 10; then
+  ok "SIGTERM during idle ends the process within 2s"
+  wait "$pid" 2>/dev/null
+  rc=$?
+  [[ $rc -eq 143 ]] && ok "SIGTERM during idle exits 143" \
+    || fail "SIGTERM during idle exits 143" "exit $rc"
+  grep -q "PHASE 2" "$log" && fail "SIGTERM during idle does not start the CPU storm" \
+    || ok "SIGTERM during idle does not start the CPU storm"
 else
-  fail "SIGTERM ends the process within 2s" "cleanup runs, then the script continues"
-  continued=0
-  extra=$((SECONDS + 8))
-  while (( SECONDS < extra )); do
-    if grep -q "PHASE 2" "$log" || [[ $(spinner_count) -gt 0 ]]; then
-      continued=1
-      break
-    fi
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 0.2
-  done
-  if (( continued )); then
-    fail "SIGTERM during idle still lets the CPU storm start" "$(spinner_count) spinners"
-  else
-    ok "SIGTERM during idle does not start the CPU storm"
-  fi
-  kill_nt_group "$pid"
+  fail "SIGTERM during idle ends the process within 2s" "had to SIGKILL pid $pid"
+  fail "SIGTERM during idle exits 143" "killed"
+  fail "SIGTERM during idle does not start the CPU storm" "never exited"
 fi
+[[ $(tmp_dirs) == "$before" ]] && ok "SIGTERM during idle removes the temp dir" \
+  || fail "SIGTERM during idle removes the temp dir" "$(tmp_dirs)"
+
+# During the CPU storm, with every spinner alive: the trap has to take the
+# workers down with it. This is the case the header actually promises.
+start_nt -y 30
+pid=$NT_PID
+log=$NT_LOG
+wait_for_phase "$pid" "$log" "PHASE 2" || true
+sleep 0.5
+spins="$(spinner_count)"
+[[ $spins -gt 0 ]] && ok "signal test caught the run mid-storm ($spins spinners)" \
+  || fail "signal test caught the run mid-storm" "no spinners; $(grep -o 'PHASE [0-9]' "$log" | tail -1)"
+kill -TERM "$pid" 2>/dev/null || true
+if wait_or_kill "$pid" 10; then
+  ok "SIGTERM mid-storm ends the process within 2s"
+  wait "$pid" 2>/dev/null
+  rc=$?
+  [[ $rc -eq 143 ]] && ok "SIGTERM mid-storm exits 143" \
+    || fail "SIGTERM mid-storm exits 143" "exit $rc"
+else
+  fail "SIGTERM mid-storm ends the process within 2s" "had to SIGKILL pid $pid"
+  fail "SIGTERM mid-storm exits 143" "killed"
+fi
+sleep 0.3
+[[ $(spinner_count) -eq 0 ]] && ok "SIGTERM mid-storm leaves no awk spinners" \
+  || fail "SIGTERM mid-storm leaves no awk spinners" "$(spinner_count) still running"
+[[ $(tmp_dirs) == "$before" ]] && ok "SIGTERM mid-storm removes the temp dir" \
+  || fail "SIGTERM mid-storm removes the temp dir" "$(tmp_dirs)"
 reap_spinners
 
 # ── committed bytecode is the SVG tool, not a second program ──────────────
