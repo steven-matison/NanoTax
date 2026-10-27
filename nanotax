@@ -1,0 +1,611 @@
+#!/usr/bin/env bash
+# NanoTax — a live hardware showcase + stress dashboard for NVIDIA Jetson boxes
+# with (optionally) a Hailo NPU on PCIe.
+#
+# Taxes the CPU, the GPU and the NPU at once and renders a live panel: per-core
+# load, thermals, memory, GPU utilisation, inference rate, and the Hailo's PCIe,
+# driver and on-chip state read straight from sysfs (no sudo).
+#
+#   nanotax              # 12 s per phase
+#   nanotax 30           # 30 s per phase
+#   nanotax --loader     # the inventory screen only, then exit
+#   nanotax -y 20        # no "press enter", 20 s per phase
+#
+# Everything it starts is time-bounded and dies with it (trap on EXIT/INT/TERM/HUP).
+# Nothing is installed, restarted, or written outside a mktemp dir — except the
+# optional CUDA burner, compiled once into ${XDG_CACHE_HOME:-~/.cache}/nanotax.
+#
+# Copyright 2026 Steven Matison. Licensed under the Apache License, Version 2.0.
+
+# Colors live in printf format strings on purpose.
+# shellcheck disable=SC2059
+set -uo pipefail
+
+VERSION="1.0.0"
+
+# ── config (all optional) ──────────────────────────────────────────────────
+# NANOTAX_INFER_URL   resident classifier: POST /classify (JPEG body), GET /health
+# NANOTAX_IMAGE       the JPEG to flood it with
+# NANOTAX_GPU         auto | infer | burn | off   (auto: infer if healthy, else burn)
+# NANOTAX_HEF         Hailo model for the NPU storm (default: first YOLO HEF found)
+# NANOTAX_HAILORTCLI  hailortcli binary (default: PATH)
+# NANOTAX_HAILO_PY    a python with hailo_platform, for the NPU die temperature
+# NANOTAX_COLOR       auto | always | never
+INFER="${NANOTAX_INFER_URL:-http://127.0.0.1:5910}"
+IMG="${NANOTAX_IMAGE:-}"
+GPU_MODE="${NANOTAX_GPU:-auto}"
+COLOR="${NANOTAX_COLOR:-auto}"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/nanotax"
+
+DUR=12; ASK=1; LOADER_ONLY=0
+
+usage() {
+  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+  cat <<EOF
+
+Options:
+  -y, --yes        start without waiting for enter
+  -l, --loader     print the banner + inventory and exit
+      --color      force color (same as NANOTAX_COLOR=always)
+  -V, --version    print the version
+  -h, --help       this help
+
+Environment: NANOTAX_INFER_URL NANOTAX_IMAGE NANOTAX_GPU NANOTAX_HEF
+             NANOTAX_HAILORTCLI NANOTAX_HAILO_PY NANOTAX_COLOR
+EOF
+}
+
+while (( $# )); do
+  case "$1" in
+    -y|--yes)     ASK=0 ;;
+    -l|--loader)  LOADER_ONLY=1 ;;
+    --color)      COLOR=always ;;
+    -V|--version) echo "nanotax $VERSION"; exit 0 ;;
+    -h|--help)    usage; exit 0 ;;
+    ''|*[!0-9]*)  echo "nanotax: unknown argument '$1' (try --help)" >&2; exit 2 ;;
+    *)            DUR="$1" ;;
+  esac
+  shift
+done
+
+WORK="$(mktemp -d /tmp/nanotax.XXXXXX)"
+PIDS=()
+TTY=0; [[ -t 1 ]] && TTY=1
+
+# ── colors ─────────────────────────────────────────────────────────────────
+if [[ $COLOR == always || ( $COLOR == auto && $TTY == 1 ) ]]; then
+  R=$'\e[0m'; B=$'\e[1m'; D=$'\e[2m'
+  RED=$'\e[38;5;203m'; GRN=$'\e[38;5;114m'; YEL=$'\e[38;5;221m'
+  BLU=$'\e[38;5;75m';  MAG=$'\e[38;5;176m'; CYN=$'\e[38;5;80m'
+  ORG=$'\e[38;5;215m'
+else
+  R='' B='' D='' RED='' GRN='' YEL='' BLU='' MAG='' CYN='' ORG=''
+fi
+
+cleanup() {
+  for p in "${PIDS[@]:-}"; do [[ -n $p ]] && kill "$p" 2>/dev/null; done
+  wait 2>/dev/null
+  rm -rf "$WORK"
+  (( TTY )) && printf '\e[?25h'   # cursor back on
+  echo
+}
+trap cleanup EXIT INT TERM HUP
+
+stop_workers() {
+  for p in "${PIDS[@]:-}"; do [[ -n $p ]] && kill "$p" 2>/dev/null; done
+  wait 2>/dev/null
+  PIDS=()
+}
+
+# ── helpers ────────────────────────────────────────────────────────────────
+hr() { printf "${D}%s${R}\n" "────────────────────────────────────────────────────────────────────────"; }
+cls() { (( TTY )) && printf '\e[H\e[J'; }
+
+# bar <pct> <width> — unicode block meter, colored by load
+bar() {
+  local pct=${1%.*} w=${2:-28} fill col i
+  (( pct < 0 )) && pct=0; (( pct > 100 )) && pct=100
+  fill=$(( pct * w / 100 ))
+  if   (( pct >= 85 )); then col=$RED
+  elif (( pct >= 60 )); then col=$ORG
+  elif (( pct >= 30 )); then col=$YEL
+  else                       col=$GRN; fi
+  printf "%s" "$col"
+  for ((i=0;i<fill;i++)); do printf '█'; done
+  printf "%s" "${D}"
+  for ((i=fill;i<w;i++)); do printf '░'; done
+  printf "%s" "$R"
+}
+
+# ── platform ───────────────────────────────────────────────────────────────
+board_model() { tr -d '\0' 2>/dev/null </proc/device-tree/model || uname -m; }
+board_short() {
+  board_model | sed -E 's/^NVIDIA //; s/^Jetson //; s/ (Engineering Reference )?Developer Kit.*//'
+}
+jetpack_ver() { dpkg-query -W -f='${Version}' nvidia-jetpack 2>/dev/null | sed 's/-b[0-9]*$//'; }
+l4t_ver() {
+  [[ -r /etc/nv_tegra_release ]] || return
+  sed -nE '1s/^# R([0-9]+) \(release\), REVISION: ([0-9.]+).*/R\1.\2/p' /etc/nv_tegra_release
+}
+cuda_ver() {
+  if [[ -r /usr/local/cuda/version.json ]]; then
+    python3 -c 'import json;print(json.load(open("/usr/local/cuda/version.json"))["cuda"]["version"])' 2>/dev/null && return
+  fi
+  command -v nvcc >/dev/null && nvcc --version | sed -nE 's/.*release ([0-9.]+).*/\1/p' && return
+  echo "?"
+}
+trt_ver() { dpkg-query -W -f='${Version}' libnvinfer-bin 2>/dev/null | sed 's/-.*//'; }
+
+# ── sensors ────────────────────────────────────────────────────────────────
+declare -a P_IDLE P_TOTAL C_PCT
+NCORE=0
+
+snap_cpu() {
+  local i=0 cpu user nice system idle iowait irq softirq steal rest idl tot
+  # shellcheck disable=SC2034  # rest swallows guest columns
+  while read -r cpu user nice system idle iowait irq softirq steal rest; do
+    [[ $cpu =~ ^cpu[0-9]+$ ]] || continue
+    idl=$(( idle + iowait ))
+    tot=$(( user + nice + system + idle + iowait + irq + softirq + steal ))
+    if (( ${P_TOTAL[i]:-0} > 0 )); then
+      local dt=$(( tot - P_TOTAL[i] )) di=$(( idl - P_IDLE[i] ))
+      if (( dt > 0 )); then C_PCT[i]=$(( 100 * (dt - di) / dt )); else C_PCT[i]=0; fi
+    else
+      C_PCT[i]=0
+    fi
+    P_IDLE[i]=$idl; P_TOTAL[i]=$tot
+    ((i++))
+  done < /proc/stat
+  NCORE=$i
+}
+
+GPU_PATH=""
+find_gpu() {
+  local c
+  for c in /sys/devices/platform/gpu.0/load \
+           /sys/devices/platform/*.gpu/load \
+           /sys/class/devfreq/*.gpu/device/load \
+           /sys/devices/gpu.0/load; do
+    [[ -r $c ]] && { GPU_PATH=$c; return; }
+  done
+}
+gpu_load() {   # permille on tegra -> percent
+  [[ -n $GPU_PATH && -r $GPU_PATH ]] || { echo "-1"; return; }
+  local v; v=$(cat "$GPU_PATH" 2>/dev/null) || { echo "-1"; return; }
+  (( v > 1000 )) && v=1000
+  echo $(( v / 10 ))
+}
+
+temp_of() {   # temp_of <substring of zone type>
+  local want="$1" z t ty
+  for z in /sys/class/thermal/thermal_zone*; do
+    ty=$(cat "$z/type" 2>/dev/null) || continue
+    [[ $ty == *"$want"* ]] || continue
+    t=$(cat "$z/temp" 2>/dev/null)
+    # some zones (Orin's cv0/cv1/cv2) exist but read back empty
+    [[ $t =~ ^-?[0-9]+$ ]] || continue
+    echo $(( t / 1000 )); return
+  done
+  echo "-1"
+}
+
+mem_pct() { free -m | awk '/^Mem:/{printf "%d", $3*100/$2}'; }
+mem_txt() { free -m | awk '/^Mem:/{printf "%.1f/%.1f GB", $3/1024, $2/1024}'; }
+
+# ── the Hailo, straight from sysfs ─────────────────────────────────────────
+HAILO_PCI=""; HAILO_NAME="Hailo"; HAILO_CLI=""; HAILO_PY=""; HEF=""
+
+find_hailo() {
+  local d
+  for d in /sys/bus/pci/devices/*; do
+    [[ $(cat "$d/vendor" 2>/dev/null) == 0x1e60 ]] || continue
+    HAILO_PCI=${d##*/}
+    case $(cat "$d/device" 2>/dev/null) in
+      0x2864) HAILO_NAME="Hailo-8" ;;
+      0x45c4) HAILO_NAME="Hailo-10H" ;;
+      *)      HAILO_NAME="Hailo" ;;
+    esac
+    break
+  done
+
+  HAILO_CLI="${NANOTAX_HAILORTCLI:-$(command -v hailortcli 2>/dev/null)}"
+  [[ -x $HAILO_CLI ]] || HAILO_CLI=""
+
+  local p
+  for p in "${NANOTAX_HAILO_PY:-}" python3 "$HOME/hailo-infer/venv/bin/python"; do
+    [[ -n $p ]] || continue
+    if "$p" -c 'import hailo_platform' 2>/dev/null; then HAILO_PY=$p; break; fi
+  done
+
+  HEF="${NANOTAX_HEF:-}"
+  if [[ -z $HEF ]]; then
+    local f
+    for f in "$HOME"/hailo/models/yolov8s.hef "$HOME"/hailo/models/yolo*.hef \
+             /usr/share/hailo-models/yolov8s*.hef /usr/share/hailo-models/yolo*.hef \
+             "$HOME"/hailo/models/*.hef; do
+      [[ -r $f ]] && { HEF=$f; break; }
+    done
+  fi
+
+  # hailortcli knows the real architecture (HAILO8 vs HAILO8L); ask once
+  if [[ -n $HAILO_PCI && -n $HAILO_CLI && -e /dev/hailo0 ]]; then
+    local arch
+    arch=$(cd "$WORK" && timeout 5 "$HAILO_CLI" fw-control identify 2>/dev/null \
+           | awk -F': ' '/Device Architecture/{print $2}')
+    case $arch in
+      HAILO8)  HAILO_NAME="Hailo-8" ;;
+      HAILO8L) HAILO_NAME="Hailo-8L" ;;
+      HAILO10H) HAILO_NAME="Hailo-10H" ;;
+    esac
+  fi
+}
+
+hailo_dev()   { [[ -e /dev/hailo0 ]] && echo "/dev/hailo0" || echo "absent"; }
+hailo_speed() { cat "/sys/bus/pci/devices/$HAILO_PCI/current_link_speed" 2>/dev/null || echo "?"; }
+hailo_width() { cat "/sys/bus/pci/devices/$HAILO_PCI/current_link_width" 2>/dev/null || echo "?"; }
+hailo_drv()   { local d; d=$(readlink "/sys/bus/pci/devices/$HAILO_PCI/driver" 2>/dev/null); echo "${d##*/}"; }
+hailo_ver()   { cat /sys/module/hailo_pci/version 2>/dev/null || echo "?"; }
+hailo_fw()    { local f; for f in /lib/firmware/hailo/*.bin; do [[ -e $f ]] && { echo "${f##*/}"; return; }; done; }
+hailo_irq() {   # MSI count; the line only appears once the chip has raised one
+  local v
+  v=$(awk '/hailo/{print $2; exit}' /proc/interrupts 2>/dev/null)
+  [[ $v =~ ^[0-9]+$ ]] && echo "$v" || echo "—"
+}
+hailo_temp() {  # on-die temperature through pyhailort; -1 when unavailable
+  [[ -n $HAILO_PY && -e /dev/hailo0 ]] || { echo "-1"; return; }
+  (cd "$WORK" && timeout 4 "$HAILO_PY" -c '
+from hailo_platform import Device
+d = Device(); t = d.control.get_chip_temperature(); d.release()
+print(int(max(t.ts0_temperature, t.ts1_temperature)))' 2>/dev/null) || echo "-1"
+}
+npu_fps() {     # last FPS hailortcli printed for the running storm
+  [[ -s $WORK/npu.txt ]] || { echo ""; return; }
+  tr '\r' '\n' <"$WORK/npu.txt" | grep -o 'FPS: [0-9.]*' | tail -1 | awk '{printf "%.0f", $2}'
+}
+
+# ── workers ────────────────────────────────────────────────────────────────
+start_cpu_storm() {
+  local n="$1" i
+  for ((i=0;i<n;i++)); do
+    awk 'BEGIN{x=0;while(1){x=(x*1.0000001)+1.234567;if(x>1e300)x=0}}' &
+    PIDS+=("$!")
+  done
+}
+
+cat > "$WORK/flood.py" <<'PY'
+import sys, time, urllib.request
+url, img, out = sys.argv[1], sys.argv[2], sys.argv[3]
+body = open(img, 'rb').read()
+f = open(out, 'a', buffering=1)
+while True:
+    t0 = time.time()
+    try:
+        req = urllib.request.Request(url, data=body,
+                                     headers={'Content-Type': 'image/jpeg'})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            r.read()
+        f.write("%.2f\n" % ((time.time() - t0) * 1000.0))
+    except Exception:
+        f.write("err\n")
+PY
+
+# A tiny CUDA kernel that spins FMAs, for boxes with no inference daemon.
+# Each launch appends one line to a log, so the dashboard can show a rate.
+BURN=""
+build_burner() {
+  [[ -x $CACHE/gpuburn ]] && { BURN=$CACHE/gpuburn; return; }
+  local nvcc; nvcc=$(command -v nvcc || echo /usr/local/cuda/bin/nvcc)
+  [[ -x $nvcc ]] || return
+  mkdir -p "$CACHE"
+  cat > "$WORK/gpuburn.cu" <<'CU'
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+__global__ void burn(float *a, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) { float x = a[i]; for (int k = 0; k < 2048; k++) x = x * 1.000001f + 0.5f; a[i] = x; }
+}
+int main(int argc, char **argv) {
+  int secs = argc > 1 ? atoi(argv[1]) : 10; int n = 1 << 22; float *a;
+  if (cudaMalloc(&a, n * sizeof(float)) != cudaSuccess) return 1;
+  time_t end = time(0) + secs;
+  while (time(0) < end) { burn<<<n / 256, 256>>>(a, n); cudaDeviceSynchronize(); printf("k\n"); fflush(stdout); }
+  cudaFree(a); return 0;
+}
+CU
+  printf "  ${D}compiling the CUDA burner once into %s …${R}\n" "$CACHE"
+  "$nvcc" -O2 -o "$CACHE/gpuburn" "$WORK/gpuburn.cu" 2>/dev/null && BURN=$CACHE/gpuburn
+}
+
+GPU_HOW="off"
+pick_gpu_mode() {
+  local healthy=0
+  [[ -n $(curl -s -m 2 "$INFER/health" 2>/dev/null) ]] && healthy=1
+  case $GPU_MODE in
+    off)   GPU_HOW="off" ;;
+    infer) GPU_HOW="infer" ;;
+    burn)  GPU_HOW="burn" ;;
+    *)     if (( healthy )) && [[ -r $IMG ]]; then GPU_HOW="infer"
+           elif command -v nvcc >/dev/null || [[ -x /usr/local/cuda/bin/nvcc || -x $CACHE/gpuburn ]]; then GPU_HOW="burn"
+           else GPU_HOW="off"; fi ;;
+  esac
+}
+
+start_gpu_storm() {
+  local n="${1:-3}" secs="${2:-$DUR}" i
+  case $GPU_HOW in
+    infer)
+      [[ -r $IMG ]] || return
+      for ((i=0;i<n;i++)); do
+        python3 "$WORK/flood.py" "$INFER/classify" "$IMG" "$WORK/lat.txt" 2>/dev/null &
+        PIDS+=("$!")
+      done ;;
+    burn)
+      [[ -n $BURN ]] || return
+      "$BURN" "$(( secs + 1 ))" >>"$WORK/burn.txt" 2>/dev/null &
+      PIDS+=("$!") ;;
+  esac
+}
+
+start_npu_storm() {
+  local secs="${1:-$DUR}"
+  npu_armed || return
+  : >"$WORK/npu.txt"
+  (cd "$WORK" && exec "$HAILO_CLI" run "$HEF" --time-to-run "$secs") >>"$WORK/npu.txt" 2>&1 &
+  NPU_PID=$!
+  PIDS+=("$NPU_PID")
+}
+npu_armed() { [[ -n $HAILO_CLI && -n $HEF && -e /dev/hailo0 ]]; }
+
+infer_stats() {   # count and mean ms over the whole run
+  [[ -s $WORK/lat.txt ]] || { echo "0 0 0"; return; }
+  awk '$1!="err"{n++;s+=$1}  $1=="err"{e++}
+       END{printf "%d %.1f %d", n, (n?s/n:0), e+0}' "$WORK/lat.txt"
+}
+burn_kernels() { [[ -s $WORK/burn.txt ]] && wc -l <"$WORK/burn.txt" || echo 0; }
+
+# ── banner ─────────────────────────────────────────────────────────────────
+banner() {
+  (( TTY )) && clear
+  printf "%s" "$CYN"
+  cat <<'EOF'
+  ███╗   ██╗ █████╗ ███╗   ██╗ ██████╗     ████████╗ █████╗ ██╗  ██╗
+  ████╗  ██║██╔══██╗████╗  ██║██╔═══██╗    ╚══██╔══╝██╔══██╗╚██╗██╔╝
+  ██╔██╗ ██║███████║██╔██╗ ██║██║   ██║       ██║   ███████║ ╚███╔╝
+  ██║╚██╗██║██╔══██║██║╚██╗██║██║   ██║       ██║   ██╔══██║ ██╔██╗
+  ██║ ╚████║██║  ██║██║ ╚████║╚██████╔╝       ██║   ██║  ██║██╔╝ ██╗
+  ╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝        ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝
+EOF
+  printf "%s" "$R"
+  local tag jp l4t
+  tag="$(board_short)"
+  [[ -n $HAILO_PCI ]] && tag+=" · $HAILO_NAME"
+  jp=$(jetpack_ver); [[ -n $jp ]] && tag+=" · JetPack $jp"
+  l4t=$(l4t_ver);    [[ -n $l4t ]] && tag+=" · L4T $l4t"
+  printf "  ${D}⚡ %s${R}\n\n" "$tag"
+}
+
+# ── inventory ──────────────────────────────────────────────────────────────
+inventory() {
+  printf "  ${B}${MAG}▞ INVENTORY${R}\n"; hr
+  local infer_h trt
+  infer_h=$(curl -s -m 3 "$INFER/health" 2>/dev/null)
+  trt=$(trt_ver)
+
+  printf "   🧠 ${B}SoC${R}        %s\n" "$(board_model)"
+  printf "   🐧 ${B}Kernel${R}     %s\n" "$(uname -r)"
+  printf "   ⚙️  ${B}Cores${R}      %s  ${D}· governor %s · nvpmodel %s${R}\n" \
+      "$(nproc)" \
+      "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo '?')" \
+      "$(nvpmodel -q 2>/dev/null | awk -F': ' '/NV Power Mode/{print $2;exit}' || echo '?')"
+  printf "   🎮 ${B}CUDA${R}       %s  ${D}· TensorRT %s${R}\n" "$(cuda_ver)" "${trt:-?}"
+  printf "   💾 ${B}Memory${R}     %s unified  ${D}· root %s used${R}\n" \
+      "$(free -h | awk '/^Mem:/{print $2}')" "$(df -h / | awk 'NR==2{print $5}')"
+
+  printf "\n   ${B}${ORG}◆ %s${R}   " "$(tr '[:lower:]' '[:upper:]' <<<"$HAILO_NAME")"
+  if [[ -z $HAILO_PCI ]]; then
+    printf "${D}● not on the PCIe bus${R}\n"
+  else
+    if [[ -e /dev/hailo0 ]]; then printf "${GRN}● ONLINE${R}\n"; else printf "${RED}● OFFLINE${R}\n"; fi
+    printf "     ${D}node${R}     %s  ${D}driver${R} %s v%s\n" \
+        "$(hailo_dev)" "$(hailo_drv)" "$(hailo_ver)"
+    printf "     ${D}pcie${R}     %s @ %s  ${D}%s${R}\n" \
+        "$HAILO_PCI" "$(hailo_speed)" "$(hailo_width)x width"
+    printf "     ${D}fw${R}       %s\n" \
+        "$( f=$(hailo_fw); [[ -n $f ]] && echo "$f loaded (NNC booted)" || echo 'not staged')"
+    local ht; ht=$(hailo_temp)
+    (( ht >= 0 )) && printf "     ${D}die${R}      %s°C\n" "$ht"
+    if [[ -n $HEF && -n $HAILO_CLI ]]; then
+      printf "     ${D}model${R}    %s ${D}· NPU storm armed${R}\n" "$(basename "$HEF" .hef)"
+    else
+      printf "     ${D}model${R}    ${D}no hailortcli + HEF · NPU storm skipped${R}\n"
+    fi
+  fi
+
+  if [[ -n $infer_h ]]; then
+    local label="INFER DAEMON"
+    [[ $infer_h == *'"tensorrt"'* ]] && label="TRT DAEMON"
+    printf "\n   ${B}${BLU}◆ %s${R} ${GRN}● :%s${R}\n" "$label" "${INFER##*:}"
+    echo "$infer_h" | python3 -c '
+import sys, json
+dim, rst = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit()
+rows = [("model",    d.get("model")),
+        ("tensorrt", d.get("tensorrt")),
+        ("vram",     "%s / %s MB free" % (d.get("device_memory_free_mb"),
+                                          d.get("device_memory_total_mb"))
+                     if d.get("device_memory_total_mb") else None),
+        ("uptime",   "%.1f h" % (d.get("uptime_s", 0) / 3600.0) if "uptime_s" in d else None),
+        ("served",   d.get("requests_served"))]
+for k, v in rows:
+    if v is not None:
+        print("     %s%-9s%s %s" % (dim, k, rst, v))
+' "$D" "$R" 2>/dev/null
+  else
+    printf "\n   ${B}${BLU}◆ GPU LOAD${R}   "
+    case $GPU_HOW in
+      burn) printf "${GRN}● CUDA burner${R} ${D}(no daemon at %s)${R}\n" "$INFER" ;;
+      *)    printf "${D}● no daemon, no nvcc · GPU storm skipped${R}\n" ;;
+    esac
+  fi
+  echo; hr; echo
+}
+
+NPU_PID=""
+
+# ── live dashboard ─────────────────────────────────────────────────────────
+PK_CPU=-1; PK_GPU=-1; PK_SOC=-1; PK_NPU=-1; PK_FPS=0
+peak() { local -n ref=$1; (( $2 > ref )) && ref=$2; }
+
+dash() {
+  local label="$1" secs="$2" icon="$3"
+  local t_end=$(( $(date +%s) + secs )) frame=0
+  local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+
+  (( TTY )) && printf '\e[?25l'   # hide cursor
+  snap_cpu; sleep 0.3
+
+  while (( $(date +%s) < t_end )); do
+    snap_cpu
+    local gl tc tg tsoc tnpu mp n ms errs s fps k
+    gl=$(gpu_load); tc=$(temp_of cpu); tg=$(temp_of gpu); tsoc=$(temp_of soc)
+    (( frame % 4 == 0 )) && tnpu=$(hailo_temp) || tnpu=${tnpu_last:--1}
+    tnpu_last=$tnpu
+    mp=$(mem_pct); read -r n ms errs < <(infer_stats)
+    fps=$(npu_fps); k=$(burn_kernels)
+    s=${spin:$(( frame % 10 )):1}
+    peak PK_CPU "$tc"; peak PK_GPU "$tg"; peak PK_SOC "$tsoc"; peak PK_NPU "$tnpu"
+    [[ -n $fps ]] && peak PK_FPS "$fps"
+
+    cls
+    printf "  ${B}${icon} %s${R}  ${CYN}%s${R}  ${D}%ss left${R}\n\n" \
+        "$label" "$s" "$(( t_end - $(date +%s) ))"
+
+    # cores
+    printf "  ${B}CPU${R}\n"
+    local i
+    for ((i=0;i<NCORE;i++)); do
+      printf "   ${D}core%d${R} %s ${B}%3d%%${R}\n" "$i" "$(bar "${C_PCT[i]:-0}" 30)" "${C_PCT[i]:-0}"
+    done
+
+    # gpu / mem
+    echo
+    if (( gl >= 0 )); then
+      printf "  ${B}GPU${R}   %s ${B}%3d%%${R}\n" "$(bar "$gl" 30)" "$gl"
+    else
+      printf "  ${B}GPU${R}   ${D}load node unavailable${R}\n"
+    fi
+    printf "  ${B}MEM${R}   %s ${B}%3d%%${R}  ${D}%s${R}\n" "$(bar "$mp" 30)" "$mp" "$(mem_txt)"
+
+    # thermals
+    echo
+    printf "  ${B}TEMP${R}  "
+    local z v
+    for z in cpu:$tc gpu:$tg soc:$tsoc npu:$tnpu; do
+      v=${z#*:}
+      (( v < 0 )) && continue
+      if   (( v >= 80 )); then printf "${RED}🔥 %s %s°C${R}  " "${z%%:*}" "$v"
+      elif (( v >= 65 )); then printf "${ORG}🌡 %s %s°C${R}  " "${z%%:*}" "$v"
+      else                     printf "${GRN}❄ %s %s°C${R}  " "${z%%:*}" "$v"; fi
+    done
+    echo
+
+    # inference
+    echo
+    if (( n > 0 )); then
+      printf "  ${B}INFER${R} ${GRN}▶${R} %s classifications  ${D}·${R} ${B}%s ms${R} ${D}mean round-trip${R}" "$n" "$ms"
+      (( errs > 0 )) && printf "  ${RED}%s err${R}" "$errs"
+      echo
+    elif (( k > 0 )); then
+      printf "  ${B}INFER${R} ${GRN}▶${R} %s CUDA kernels  ${D}· burner holding the GPU${R}\n" "$k"
+    else
+      printf "  ${B}INFER${R} ${D}idle — GPU not under load${R}\n"
+    fi
+
+    # hailo
+    printf "  ${B}HAILO${R} "
+    if [[ -z $HAILO_PCI ]]; then
+      printf "${D}◆ none on this box${R}\n"
+    elif [[ ! -e /dev/hailo0 ]]; then
+      printf "${RED}◆ offline${R}\n"
+    elif [[ -n $fps ]] && kill -0 "${NPU_PID:-0}" 2>/dev/null; then
+      printf "${ORG}◆${R} ${B}%s FPS${R} %s ${D}· %s %sx · irq %s${R}\n" \
+          "$fps" "$(basename "$HEF" .hef)" "$(hailo_speed)" "$(hailo_width)" "$(hailo_irq)"
+    else
+      printf "${ORG}◆${R} %s ${D}%s · irq %s · idle${R}\n" \
+          "$(hailo_speed)" "$(hailo_width)x" "$(hailo_irq)"
+    fi
+
+    ((frame++))
+    sleep 0.45
+  done
+  (( TTY )) && printf '\e[?25h'
+}
+
+# ── verdict ────────────────────────────────────────────────────────────────
+verdict() {
+  cls
+  printf "  ${B}${MAG}▞ VERDICT${R}\n"; hr
+  local n ms errs k
+  read -r n ms errs < <(infer_stats)
+  k=$(burn_kernels)
+  printf "   ⚡ ${B}Peak thermals${R}   cpu %s°C · gpu %s°C · soc %s°C" "$PK_CPU" "$PK_GPU" "$PK_SOC"
+  (( PK_NPU >= 0 )) && printf " · npu %s°C" "$PK_NPU"
+  echo
+  if (( n > 0 )); then
+    printf "   🧮 ${B}Classifications${R} %s  ${D}mean %s ms round-trip over loopback${R}\n" "$n" "$ms"
+  elif (( k > 0 )); then
+    printf "   🧮 ${B}CUDA kernels${R}    %s  ${D}burner launches, 4M threads each${R}\n" "$k"
+  fi
+  (( errs > 0 )) && printf "   ${RED}✗ %s failed requests${R}\n" "$errs"
+  if [[ -n $HAILO_PCI ]]; then
+    printf "   ◆ ${B}%-15s${R} %s · %s @ %s %sx" "$HAILO_NAME" \
+        "$(hailo_dev)" "$(hailo_drv)" "$(hailo_speed)" "$(hailo_width)"
+    (( PK_FPS > 0 )) && printf "  ${B}%s FPS${R} ${D}peak %s${R}" "$PK_FPS" "$(basename "$HEF" .hef)"
+    echo
+  fi
+  printf "   💾 ${B}Memory now${R}      %s\n" "$(mem_txt)"
+  hr
+  printf "   ${D}Every worker killed · nothing persisted outside /tmp${R}\n\n"
+}
+
+# ── run ────────────────────────────────────────────────────────────────────
+find_gpu
+find_hailo
+pick_gpu_mode
+banner
+inventory
+(( LOADER_ONLY )) && exit 0
+
+[[ $GPU_HOW == burn ]] && build_burner
+printf "  ${D}Taxing for %ss per phase. Ctrl-C is safe — workers die with the script.${R}\n" "$DUR"
+if (( ASK && TTY )); then printf "  ${D}Press enter to GO${R} "; read -r _; fi
+
+dash "PHASE 1 · IDLE BASELINE" 5 "💤"
+
+start_cpu_storm "$(nproc)"
+dash "PHASE 2 · CPU STORM · $(nproc) workers" "$DUR" "🔥"
+stop_workers
+
+start_gpu_storm 3 "$DUR"
+dash "PHASE 3 · GPU STORM · $([[ $GPU_HOW == burn ]] && echo 'CUDA burner' || echo 'TensorRT flood')" "$DUR" "🎮"
+stop_workers
+
+if npu_armed; then
+  start_npu_storm "$DUR"
+  dash "PHASE 4 · NPU STORM · $HAILO_NAME $(basename "$HEF" .hef)" "$DUR" "◆"
+  stop_workers
+fi
+
+start_cpu_storm "$(nproc)"
+start_gpu_storm 3 "$DUR"
+start_npu_storm "$DUR"
+dash "PHASE 5 · FULL TAX · CPU + GPU + NPU" "$DUR" "💥"
+stop_workers
+
+dash "PHASE 6 · COOLDOWN" 6 "❄️"
+
+verdict
