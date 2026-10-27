@@ -68,7 +68,7 @@ while (( $# )); do
   shift
 done
 
-WORK="$(mktemp -d /tmp/nanotax.XXXXXX)"
+WORK="$(mktemp -d /tmp/nanotax.XXXXXX)" || exit 1
 PIDS=()
 TTY=0; [[ -t 1 ]] && TTY=1
 
@@ -82,18 +82,49 @@ else
   R='' B='' D='' RED='' GRN='' YEL='' BLU='' MAG='' CYN='' ORG=''
 fi
 
+# TERM first. Anything still alive after a short beat gets KILL, so a worker
+# that ignores TERM cannot outlive the script or the phase that started it.
+kill_workers() {
+  local p live=0
+  for p in "${PIDS[@]:-}"; do
+    [[ -n ${p:-} ]] || continue
+    kill "$p" 2>/dev/null || true
+    kill -0 "$p" 2>/dev/null && live=1
+  done
+  if (( live )); then
+    sleep 0.2
+    for p in "${PIDS[@]:-}"; do
+      [[ -n ${p:-} ]] || continue
+      kill -0 "$p" 2>/dev/null || continue
+      kill -KILL "$p" 2>/dev/null || true
+    done
+  fi
+  wait 2>/dev/null || true
+}
+
 cleanup() {
-  for p in "${PIDS[@]:-}"; do [[ -n $p ]] && kill "$p" 2>/dev/null; done
-  wait 2>/dev/null
-  rm -rf "$WORK"
+  # Drop the traps before exiting, or EXIT runs this function a second time.
+  trap - EXIT INT TERM HUP
+  kill_workers
+  [[ -n ${WORK:-} && -d "$WORK" ]] && rm -rf "$WORK"
   (( TTY )) && printf '\e[?25h'   # cursor back on
   echo
 }
-trap cleanup EXIT INT TERM HUP
+on_signal() {
+  cleanup
+  case $1 in
+    INT)  exit 130 ;;
+    TERM) exit 143 ;;
+    *)    exit 129 ;;
+  esac
+}
+trap cleanup EXIT
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
+trap 'on_signal HUP' HUP
 
 stop_workers() {
-  for p in "${PIDS[@]:-}"; do [[ -n $p ]] && kill "$p" 2>/dev/null; done
-  wait 2>/dev/null
+  kill_workers
   PIDS=()
 }
 
@@ -552,8 +583,21 @@ verdict() {
   local n ms errs k
   read -r n ms errs < <(infer_stats)
   k=$(burn_kernels)
-  printf "   ⚡ ${B}Peak thermals${R}   cpu %s°C · gpu %s°C · soc %s°C" "$PK_CPU" "$PK_GPU" "$PK_SOC"
-  (( PK_NPU >= 0 )) && printf " · npu %s°C" "$PK_NPU"
+  printf "   ⚡ ${B}Peak thermals${R}  "
+  local shown=0 name val
+  for name in cpu gpu soc npu; do
+    case $name in
+      cpu) val=$PK_CPU ;;
+      gpu) val=$PK_GPU ;;
+      soc) val=$PK_SOC ;;
+      npu) val=$PK_NPU ;;
+    esac
+    (( val >= 0 )) || continue
+    (( shown )) && printf " · "
+    printf "%s %s°C" "$name" "$val"
+    shown=1
+  done
+  (( shown )) || printf "${D}no zones${R}"
   echo
   if (( n > 0 )); then
     printf "   🧮 ${B}Classifications${R} %s  ${D}mean %s ms round-trip over loopback${R}\n" "$n" "$ms"
@@ -569,7 +613,7 @@ verdict() {
   fi
   printf "   💾 ${B}Memory now${R}      %s\n" "$(mem_txt)"
   hr
-  printf "   ${D}Every worker killed · nothing persisted outside /tmp${R}\n\n"
+  printf "   ${D}Every worker killed · temp dir removed${R}\n\n"
 }
 
 # ── run ────────────────────────────────────────────────────────────────────
@@ -591,7 +635,12 @@ dash "PHASE 2 · CPU STORM · $(nproc) workers" "$DUR" "🔥"
 stop_workers
 
 start_gpu_storm 3 "$DUR"
-dash "PHASE 3 · GPU STORM · $([[ $GPU_HOW == burn ]] && echo 'CUDA burner' || echo 'TensorRT flood')" "$DUR" "🎮"
+case $GPU_HOW in
+  burn)  gpu_label="CUDA burner" ;;
+  infer) gpu_label="TensorRT flood" ;;
+  *)     gpu_label="skipped" ;;
+esac
+dash "PHASE 3 · GPU STORM · $gpu_label" "$DUR" "🎮"
 stop_workers
 
 if npu_armed; then
