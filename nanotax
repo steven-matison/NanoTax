@@ -236,7 +236,7 @@ find_hailo() {
   [[ -x $HAILO_CLI ]] || HAILO_CLI=""
 
   local p
-  for p in "${NANOTAX_HAILO_PY:-}" python3 "$HOME/hailo-infer/venv/bin/python"; do
+  for p in "${NANOTAX_HAILO_PY:-}" python3; do
     [[ -n $p ]] || continue
     # importing hailo_platform drops a hailort.log in the cwd, so probe from WORK
     if (cd "$WORK" && "$p" -c 'import hailo_platform' 2>/dev/null); then HAILO_PY=$p; break; fi
@@ -245,9 +245,8 @@ find_hailo() {
   HEF="${NANOTAX_HEF:-}"
   if [[ -z $HEF ]]; then
     local f
-    for f in "$HOME"/hailo/models/yolov8s.hef "$HOME"/hailo/models/yolo*.hef \
-             /usr/share/hailo-models/yolov8s*.hef /usr/share/hailo-models/yolo*.hef \
-             "$HOME"/hailo/models/*.hef; do
+    for f in /usr/share/hailo-models/yolov8s*.hef /usr/share/hailo-models/yolo*.hef \
+             /usr/share/hailo-models/*.hef; do
       [[ -r $f ]] && { HEF=$f; break; }
     done
   fi

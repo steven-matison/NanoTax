@@ -13,7 +13,7 @@ CPU storm, GPU storm, NPU storm, then all three together, on one terminal dashbo
 ![version](https://img.shields.io/badge/nanotax-1.0.0-5fd7d7.svg)
 ![shellcheck](https://img.shields.io/badge/shellcheck-clean-brightgreen.svg)
 ![sudo](https://img.shields.io/badge/sudo-never-success.svg)
-![deps](https://img.shields.io/badge/dependencies-bash%20%C2%B7%20awk%20%C2%B7%20curl-lightgrey.svg)
+![deps](https://img.shields.io/badge/dependencies-bash%20%C2%B7%20awk%20%C2%B7%20curl%20%C2%B7%20python3-lightgrey.svg)
 
 [![NVIDIA Jetson](https://img.shields.io/badge/NVIDIA-Jetson%20Orin%20Nano-76B900?logo=nvidia&logoColor=white)](https://developer.nvidia.com/embedded/jetson-orin-nano-developer-kit)
 ![JetPack](https://img.shields.io/badge/JetPack-7.2.1-76B900?logo=nvidia&logoColor=white)
@@ -150,9 +150,9 @@ Everything is optional. With no configuration NanoTax finds what it can and skip
 | `NANOTAX_INFER_URL` | `http://127.0.0.1:5910` | a resident classifier to flood in the GPU phase |
 | `NANOTAX_IMAGE` | none | the JPEG the flood clients POST |
 | `NANOTAX_GPU` | `auto` | `infer`, `burn`, `off`, or `auto` (daemon if healthy, else the CUDA burner) |
-| `NANOTAX_HEF` | first YOLO HEF in `~/hailo/models`, then `/usr/share/hailo-models` | the model for the NPU storm |
+| `NANOTAX_HEF` | first YOLO HEF in `/usr/share/hailo-models` | the model for the NPU storm |
 | `NANOTAX_HAILORTCLI` | `hailortcli` on `PATH` | a `hailortcli` built somewhere else |
-| `NANOTAX_HAILO_PY` | `python3`, then `~/hailo-infer/venv/bin/python` | a Python with `hailo_platform`, for the die temperature |
+| `NANOTAX_HAILO_PY` | `python3` | a Python with `hailo_platform`, for the die temperature |
 | `NANOTAX_COLOR` | `auto` | `always` or `never` |
 
 ### The inference daemon contract
@@ -170,10 +170,13 @@ With no daemon running, NanoTax compiles a 20-line CUDA kernel once with `nvcc` 
 
 ## The NPU phase
 
-NanoTax does not install anything on the Hailo side. Phase 4 runs when three things are already on the box: the `hailo_pci` driver with `/dev/hailo0` up, a `hailortcli`, and a compiled HEF. The die temperature on the TEMP row also needs a Python with `hailo_platform`. Those come from Hailo's own public projects: [hailort-drivers](https://github.com/hailo-ai/hailort-drivers), [hailort](https://github.com/hailo-ai/hailort) and the [Hailo Model Zoo](https://github.com/hailo-ai/hailo_model_zoo). Point NanoTax at a `hailortcli` built outside `PATH`:
+NanoTax does not install anything on the Hailo side. Phase 4 runs when three things are already on the box: the `hailo_pci` driver with `/dev/hailo0` up, a `hailortcli`, and a compiled HEF. The die temperature on the TEMP row also needs a Python with `hailo_platform`. Those come from Hailo's own public projects: [hailort-drivers](https://github.com/hailo-ai/hailort-drivers), [hailort](https://github.com/hailo-ai/hailort) and the [Hailo Model Zoo](https://github.com/hailo-ai/hailo_model_zoo). Anything built or downloaded outside the default locations is pointed at with env:
 
 ```bash
-NANOTAX_HAILORTCLI=~/hailo/hailort/build/hailort/hailortcli/hailortcli nanotax
+NANOTAX_HAILORTCLI=/path/to/hailortcli \
+NANOTAX_HEF=/path/to/yolov8s.hef \
+NANOTAX_HAILO_PY=/path/to/venv/bin/python \
+  nanotax
 ```
 
 Without them the inventory says which piece is missing and phase 4 is skipped.
