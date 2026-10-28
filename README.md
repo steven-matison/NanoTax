@@ -125,8 +125,6 @@ Jetson Orin Nano Developer Kit Super at 25 W, JetPack 7.2.1, a Hailo-8 M.2 M-key
 
 `hailortcli benchmark` on YOLOv8n reports 398 FPS, 2.93 ms hardware latency and 2.95 W average module power. YOLOv11s is a multi-context network, so at batch 1 it pays a context switch per frame.
 
-**One YOLOv8s frame end to end** from Python (letterbox to 640×640, on-chip NMS, boxes mapped back): 10.7 ms median over 20 runs on a 1546 px image.
-
 **Contention.** On its own the NPU holds 397 FPS on YOLOv8n and 379 on YOLOv8s. In the full-tax phase, with all six CPU cores pegged by the storm, those drop to 222 and 279. The Hailo is not the bottleneck there: `hailortcli` feeds it frames from the host, and the host is busy. The TensorRT daemon on the GPU barely moves across the same phases, holding about 26 ms mean round-trip with three concurrent clients.
 
 ### The bare Hailo-8 module needs a heatsink
@@ -170,57 +168,15 @@ GET  /health      → JSON; these keys are shown when present:
 
 With no daemon running, NanoTax compiles a 20-line CUDA kernel once with `nvcc` into `~/.cache/nanotax/gpuburn` and uses that to hold the GPU instead.
 
-## Getting YOLO onto a Hailo-8 on a Jetson, no login wall
+## The NPU phase
 
-Everything here came from public sources. The driver and the CLI build on the Jetson itself.
-
-```bash
-# PCIe driver + firmware (HailoRT 4.24.0 is the Hailo-8 line)
-git clone --depth 1 --branch v4.24.0 https://github.com/hailo-ai/hailort-drivers.git ~/hailo/hailort-drivers
-make -C ~/hailo/hailort-drivers/linux/pcie all
-~/hailo/hailort-drivers/download_firmware.sh
-sudo mkdir -p /lib/firmware/hailo
-sudo cp ~/hailo/hailort-drivers/hailo8_fw.4.24.0.bin /lib/firmware/hailo/hailo8_fw.bin
-sudo cp ~/hailo/hailort-drivers/linux/pcie/51-hailo-udev.rules /etc/udev/rules.d/
-sudo make -C ~/hailo/hailort-drivers/linux/pcie install
-sudo modprobe hailo_pci
-```
-
-```bash
-# hailortcli and libhailort (CMake 4.x needs the policy flag for the vendored CLI11)
-git clone --depth 1 --branch v4.24.0 https://github.com/hailo-ai/hailort.git ~/hailo/hailort
-cd ~/hailo/hailort
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5
-cmake --build build --config release -j6 --target hailortcli
-```
-
-```bash
-# precompiled Hailo-8 HEFs; Model Zoo v2.20.0 pairs with HailoRT 4.24.0
-mkdir -p ~/hailo/models && cd ~/hailo/models
-for m in yolov8n yolov8s yolov11s mobilenet_v2_1.0; do
-  curl -fLO "https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.20.0/hailo8/$m.hef"
-done
-~/hailo/hailort/build/hailort/hailortcli/hailortcli run ~/hailo/models/yolov8s.hef --time-to-run 5
-```
-
-```bash
-# pyhailort for Python 3.12, built from the same tree into its own venv
-python3 -m venv ~/hailo-infer/venv
-~/hailo-infer/venv/bin/pip install numpy pillow setuptools wheel
-cd ~/hailo/hailort/hailort/libhailort/bindings/python/platform
-LIBHAILORT_PATH=~/hailo/hailort/build/hailort/libhailort/src/libhailort.so.4.24.0 \
-HAILORT_INCLUDE_DIR=~/hailo/hailort/hailort/libhailort/include \
-CMAKE_POLICY_VERSION_MINIMUM=3.5 \
-  ~/hailo-infer/venv/bin/pip install . --no-deps --no-build-isolation
-```
-
-The module is not DKMS-managed, so a kernel update means running the `make install` and `modprobe` again. The driver logs `Setting max_desc_page_size to 256 (recommended value is 4096)` on Orin; the Tegra PCIe root complex caps the transaction size, and YOLOv8s still runs at 379 FPS with it.
-
-Then point NanoTax at the build:
+NanoTax does not install anything on the Hailo side. Phase 4 runs when three things are already on the box: the `hailo_pci` driver with `/dev/hailo0` up, a `hailortcli`, and a compiled HEF. The die temperature on the TEMP row also needs a Python with `hailo_platform`. Those come from Hailo's own public projects: [hailort-drivers](https://github.com/hailo-ai/hailort-drivers), [hailort](https://github.com/hailo-ai/hailort) and the [Hailo Model Zoo](https://github.com/hailo-ai/hailo_model_zoo). Point NanoTax at a `hailortcli` built outside `PATH`:
 
 ```bash
 NANOTAX_HAILORTCLI=~/hailo/hailort/build/hailort/hailortcli/hailortcli nanotax
 ```
+
+Without them the inventory says which piece is missing and phase 4 is skipped.
 
 ## What it promises
 
